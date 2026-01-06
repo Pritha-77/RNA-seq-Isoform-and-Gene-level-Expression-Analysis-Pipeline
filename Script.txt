@@ -1,0 +1,239 @@
+#------------------------------------------------#
+#Dataset details
+#------------------------------------------------#
+
+GSE259357: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=gse259357  
+          
+GSM8114727	   SRR28119113         KRAS pancreatic organoids, replicate 1, RNA-seq                           
+GSM8114728	   SRR28119112         KRAS pancreatic organoids, replicate 2, RNA-seq
+GSM8114729	   SRR28119111         KRAS pancreatic organoids overexpressing SPIB, replicate 1, RNA-seq
+GSM8114730	   SRR2811911          KRAS pancreatic organoids overexpressing SPIB, replicate 2, RNA-seq
+
+#------------------------------------------------#
+#Create and activate a new Conda environment
+#------------------------------------------------#
+#Create and activate a new Conda environment
+conda create -n rnaseq_env python=3.9
+conda activate rnaseq_env
+
+# Install Salmon and trim-galore for adapter trimming
+conda install -c bioconda salmon trim-galore
+ 
+salmon --version
+
+#------------------------------------------------#
+#Setting Up Your Reference Data
+#------------------------------------------------#
+
+#For human data: http://refgenomes.databio.org/v3/assets/splash/2230c535660fb4774114bfa966a62f823fdb6d21acf138d4/salmon_partial_sa_index?tag=default
+#For mouse data: http://refgenomes.databio.org/v3/assets/splash/0f10d83b1050c08dd53189986f60970b92a315aa7a16a6f1/salmon_partial_sa_index?tag=default
+
+#Download all the files under "Asset directory contents" and put it in "mm10-genome-index" folder
+
+
+#------------------------------------------------#
+#Step 1: Quality Control and Trimming
+#------------------------------------------------#
+trim_galore --fastqc \
+    --paired \
+    --cores 8 \
+    ~/RNAseq/raw/SRR28119110_R1_001.fastq.gz \
+    ~/RNAseq/raw/SRR28119110_R2_001.fastq.gz \
+    -o ~/RNAseq/isoform_analysis/trimmed/SRR28119110
+
+#------------------------------------------------#
+#Step 2: Quantifying Isoforms with Salmon
+#------------------------------------------------#
+# Run Salmon quantification
+salmon quant -i ~/RNAseq/mm10-genome-index/ \
+    -l A \
+    -1 ~/RNAseq/trimmed/SRR28119110/SRR28119110_R1_001_val_1.fq.gz \
+    -2 ~/RNAseq/trimmed/SRR28119110/SRR28119110_R2_001_val_2.fq.gz \
+    --validateMappings \
+    -p 8 \
+    -o ~/RNAseq/isoform_quantification/SRR28119110
+	
+
+###In R Sturio ###
+
+
+#------------------------------------------------#
+#Step 3: Interprtiation of the Results
+#------------------------------------------------#
+library(data.table)
+library(stringr)
+ 
+# Read in the GTF file - this contains our transcript annotations
+gtf_mm10 <- fread("~/RNAseq/mm10-genome-index/0f10d83b1050c08dd53189986f60970b92a315aa7a16a6f1.gtf", skip = 5)
+ 
+# Focus on transcript-level information
+gtf_mm10 <- gtf_mm10[gtf_mm10[[3]] == "transcript"]
+ 
+# Create a clean annotation table
+transcript_annot <- data.table(
+    trascript_id = gsub("transcript_id| |\"", "", 
+                        sapply(strsplit(gtf_mm10[[9]], ";"), "[[", 3)),
+    trascript_name = gsub("transcript_name| |\"", "", 
+                         sapply(strsplit(gtf_mm10[[9]], ";"), "[[", 8))
+)
+ 
+# Add annotations to our quantification results
+quant_SRR28119110 <- fread("isoform_quantification/SRR28119110/quant.sf")
+ 
+quant_SRR28119110$trascript_name <- gsub("\\..*$", "", quant_SRR28119110$trascript_name)
+ 
+quant_SRR28119110$trascript_name <- transcript_annot$trascript_name[
+    match(quant_SRR28119110$Name, transcript_annot$trascript_id)
+]
+ 
+# Save our annotated results
+fwrite(quant_SRR28119110, 
+       "~/RNAseq/isoform_quantification/SRR28119110/quant_annotated.sf")
+	   
+#------------------------------------------------#	   
+#Step 4: Differential Isoform Expression Analysis
+#------------------------------------------------#
+
+###Creating the Isoform Expression Matrix
+
+# Install tximport
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+ 
+BiocManager::install(c("tximport", "rtracklayer"))
+ 
+library(tximport)
+library(rtracklayer)
+ 
+# Estimate counts of the transcripts
+files <- list.files("~/RNAseq/isoform_analysis/quantification", pattern = "quant.sf", full.names = TRUE, recursive = T)
+names(files) <- basename(dirname(files))
+ 
+txi <- tximport(files, type = "salmon", txOut = TRUE, countsFromAbundance = "lengthScaledTPM")
+count_tbl <- as.data.frame(txi$counts)
+ 
+# Remove trascript ID version suffix if necessary
+rownames(count_tbl) <- gsub("\\..*$", "", rownames(count_tbl))
+count_tbl$transcript_id <- rownames(count_tbl)
+ 
+# Annotate the trascript ID 
+count_tbl$trascript_name <- transcript_annot$trascript_name[
+  match(rownames(count_tbl), transcript_annot$trascript_id)]
+ 
+# Order the columns of the count table
+count_tbl <- count_tbl[, c(5:6, 1:4)]
+ 
+# Save the transcript count table
+fwrite(count_tbl, "isoform_expression_counts.tsv", sep = "\t")
+ 
+ 
+# Create a TPM matrix if you prefer TPMs
+tpm_tbl <- as.data.frame(txi$abundance)
+rownames(tpm_tbl) <- gsub("\\..*$", "", rownames(tpm_tbl))
+ 
+tpm_tbl$transcript_id <- rownames(tpm_tbl)
+tpm_tbl$trascript_name <- transcript_annot$trascript_name[
+  match(rownames(tpm_tbl), transcript_annot$trascript_id)]
+ 
+tpm_tbl <- tpm_tbl[, c(5:6, 1:4)]
+ 
+fwrite(tpm_tbl, "isoform_expression_tpm.tsv", sep = "\t")
+
+#------------------------------------------------#	
+#Creating the Gene-level Expression Matrix
+#------------------------------------------------#	
+# Load the GTF file
+gtf_annot <- import("~/RNAseq/mm10-genome-index/0f10d83b1050c08dd53189986f60970b92a315aa7a16a6f1.gtf")
+ 
+# Create a transcript-gene annotation table
+gene_symbols <- na.omit(unique(data.frame(
+  gene_id = gtf_annot$transcript_id,
+  gene_symbol = gtf_annot$gene_name
+)))
+ 
+# Quantify gene expression
+txi_gene <- tximport(files, type = "salmon", tx2gene = gene_symbols, ignoreTxVersion = T)
+ 
+txi_gene_count <- as.data.frame(txi_gene$counts)
+txi_gene_tpm <- as.data.frame(txi_gene$abundance)
+ 
+fwrite(txi_gene_count, "gene_expression_counts.tsv", sep = "\t", row.names = T)
+fwrite(txi_gene_tpm, "gene_expression_tpm.tsv", sep = "\t", row.names = T)
+
+#Load the required packages
+library(data.table)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(ggrepel)
+library(ggfortify)
+library(stats)
+library(sva)
+
+count_tbl <- fread("gene_expression_counts.tsv", data.table = F)
+
+#Data Cleaning
+rownames(count_tbl) <- count_tbl[[1]]
+count_tbl <- count_tbl[, -1]
+
+#Filtering Low-Expressed Genes (keep genes that are expressed in at least 80% of the samples)
+perc_keep <- 0.8
+gene_keep <- rowSums(count_tbl > 0) >= ceiling(perc_keep * ncol(count_tbl))
+count_tbl_low_rm <- count_tbl[gene_keep, ]
+
+#Creating Metadata
+meta <- data.frame(SampleID = colnames(count_tbl),
+                   Treatment = c("KRAS_SPIB", "KRAS_SPIB", "KRAS", "KRAS"))
+rownames(meta) <- meta$SampleID
+
+dge <- DGEList(counts=count_tbl_low_rm, samples = meta)
+
+#Normalization
+dge <- calcNormFactors(dge, method = "TMM")
+dge_v <- voom(dge, plot=TRUE)
+# save the dge_v object for later use
+saveRDS(dge_v, "dge_v.rds")
+
+#Creating a PCA Plot
+shape_column <- "Treatment"
+color_column <- "Treatment"
+label <- TRUE
+label_size <- 4
+plot_save_name <- "PCA_Plot.pdf"
+ 
+meta_table <- dge_v$targets
+count_table_t <- as.data.frame(t(dge_v$E))
+pca_prep <- prcomp(count_table_t, scale. = TRUE)
+ 
+pca_plot <- autoplot(pca_prep, label, shape = shape_column, data = meta_table, colour = color_column) +
+  geom_text_repel(aes(label = rownames(meta_table)), size = label_size) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.grid.minor.y=element_blank(),
+        panel.grid.major.y=element_blank())
+ 
+ggsave(plot_save_name, device = "pdf", units = "cm", width = 16, height = 14)
+
+#Differential Expression Analysis
+comparison <- "KRAS_SPIB-KRAS"
+ 
+design <- model.matrix(~ 0 + dge_v$targets[["Treatment"]])
+
+#makeContrasts(KRAS_SPIB_vs_KRAS = KRAS_SPIB - KRAS)
+
+
+
+#design <- model.matrix(~ 0 + Treatment, data = meta)
+
+colnames(design) <- gsub(".*]]", "", colnames(design))
+ 
+contrast_matrix <- makeContrasts(contrasts = comparison, levels = design)
+ 
+fit <- lmFit(dge_v, design)
+fit_2 <- contrasts.fit(fit, contrast_matrix)
+fit_2 <- eBayes(fit_2)
+ 
+deg_tbl <- topTable(fit_2, coef = colnames(contrast_matrix), n = Inf, p.value=1, lfc=0, sort.by = "p")
+fwrite(deg_tbl, "DEG_P1_lfc0.tsv", sep = "\t", row.names = T)
